@@ -137,5 +137,13 @@ mod tests {
         assert!(store.list(path, true).await.is_err());
         assert!(store.list(path, false).await.is_err());
         assert!(store.stat(path).await.is_err());
+        assert!(store
+            .presign_get(path, std::time::Duration::from_secs(60))
+            .await
+            .is_err());
+        assert!(store
+            .presign_put(path, std::time::Duration::from_secs(60))
+            .await
+            .is_err());
     }
 }
