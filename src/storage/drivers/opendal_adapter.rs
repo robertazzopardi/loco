@@ -5,7 +5,9 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use opendal::{layers::RetryLayer, Operator};
 
-use super::{GetResponse, ListEntry, PresignedRequest, StoreDriver, UploadResponse};
+use super::{
+    GetResponse, ListEntry, PresignPutOptions, PresignedRequest, StoreDriver, UploadResponse,
+};
 use crate::storage::{stream::BytesStream, StorageError, StorageResult};
 
 pub struct OpendalAdapter {
@@ -224,11 +226,22 @@ impl StoreDriver for OpendalAdapter {
     ///
     /// Returns a `StorageResult` if the backend doesn't support presigning or
     /// the request could not be built.
-    async fn presign_put(&self, path: &Path, expire: Duration) -> StorageResult<PresignedRequest> {
-        let req = self
-            .opendal_impl
-            .presign_write(&path.display().to_string(), expire)
-            .await?;
+    async fn presign_put(
+        &self,
+        path: &Path,
+        expire: Duration,
+        options: PresignPutOptions,
+    ) -> StorageResult<PresignedRequest> {
+        let path = path.display().to_string();
+        let req = match options.content_type.as_deref() {
+            Some(content_type) => {
+                self.opendal_impl
+                    .presign_write_with(&path, expire)
+                    .content_type(content_type)
+                    .await?
+            }
+            None => self.opendal_impl.presign_write(&path, expire).await?,
+        };
         Ok(PresignedRequest::new(
             req.method().clone(),
             req.uri().clone(),

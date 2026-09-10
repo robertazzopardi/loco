@@ -15,6 +15,9 @@ pub mod mem;
 pub mod null;
 pub mod opendal_adapter;
 
+#[cfg(all(test, feature = "storage_aws_s3"))]
+mod aws_presign_tests;
+
 use super::{stream::BytesStream, StorageError, StorageResult};
 
 #[derive(Debug)]
@@ -60,6 +63,19 @@ impl PresignedRequest {
             headers,
         }
     }
+
+    /// The presigned URL as a string.
+    #[must_use]
+    pub fn url(&self) -> String {
+        self.uri.to_string()
+    }
+}
+
+/// Optional parameters for [`StoreDriver::presign_put`].
+#[derive(Debug, Clone, Default)]
+pub struct PresignPutOptions {
+    /// `Content-Type` header included in the signed request.
+    pub content_type: Option<String>,
 }
 
 /// A single entry returned by [`StoreDriver::list`] or [`StoreDriver::stat`].
@@ -267,8 +283,13 @@ pub trait StoreDriver: Sync + Send {
     ///
     /// Returns a `StorageResult` if the driver doesn't support presigning or
     /// the request could not be built.
-    async fn presign_put(&self, path: &Path, expire: Duration) -> StorageResult<PresignedRequest> {
-        let _ = (path, expire);
+    async fn presign_put(
+        &self,
+        path: &Path,
+        expire: Duration,
+        options: PresignPutOptions,
+    ) -> StorageResult<PresignedRequest> {
+        let _ = (path, expire, options);
         Err(StorageError::Any(
             "presign_put is not supported by this storage driver".into(),
         ))

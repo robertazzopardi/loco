@@ -1,11 +1,15 @@
 pub mod replicated;
 pub mod single;
 
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use bytes::Bytes;
 
-use crate::storage::{drivers::ListEntry, stream::BytesStream, Storage, StorageResult};
+use crate::storage::{
+    drivers::{ListEntry, PresignPutOptions, PresignedRequest},
+    stream::BytesStream,
+    Storage, StorageResult,
+};
 
 #[async_trait::async_trait]
 pub trait StorageStrategy: Sync + Send {
@@ -22,6 +26,19 @@ pub trait StorageStrategy: Sync + Send {
         recursive: bool,
     ) -> StorageResult<Vec<ListEntry>>;
     async fn stat(&self, storage: &Storage, path: &Path) -> StorageResult<ListEntry>;
+    async fn presign_get(
+        &self,
+        storage: &Storage,
+        path: &Path,
+        expire: Duration,
+    ) -> StorageResult<PresignedRequest>;
+    async fn presign_put(
+        &self,
+        storage: &Storage,
+        path: &Path,
+        expire: Duration,
+        options: PresignPutOptions,
+    ) -> StorageResult<PresignedRequest>;
 
     /// Download content as a stream for memory-efficient large file handling.
     ///
