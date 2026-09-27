@@ -61,6 +61,50 @@ pub struct Storage {
     pub strategy: Box<dyn strategies::StorageStrategy>,
 }
 
+/// Builds a single [`StoreDriver`] from a [`crate::config::StorageConfig`].
+///
+/// Shared by [`create_storage_provider`] (single default store) and
+/// [`multi_stores_from_config`] (one driver per named store).
+fn driver_from_config(cfg: &crate::config::StorageConfig) -> StorageResult<Box<dyn StoreDriver>> {
+    use crate::config::StorageConfig;
+
+    Ok(match cfg {
+        #[cfg(feature = "storage_aws_s3")]
+        StorageConfig::Aws(c) => {
+            if let (Some(key_id), Some(secret_key)) = (&c.access_key_id, &c.secret_access_key) {
+                let credentials = drivers::aws::Credential {
+                    key_id: key_id.clone(),
+                    secret_key: secret_key.clone(),
+                    token: c.session_token.clone(),
+                };
+                if let Some(endpoint) = &c.endpoint {
+                    drivers::aws::with_credentials_and_endpoint(
+                        &c.bucket,
+                        &c.region,
+                        endpoint,
+                        credentials,
+                    )?
+                } else {
+                    drivers::aws::with_credentials(&c.bucket, &c.region, credentials)?
+                }
+            } else {
+                drivers::aws::new(&c.bucket, &c.region)?
+            }
+        }
+        #[cfg(feature = "storage_gcp")]
+        StorageConfig::Gcp(c) => drivers::gcp::new(&c.bucket, &c.credential_path)?,
+        #[cfg(feature = "storage_azure")]
+        StorageConfig::Azure(c) => {
+            drivers::azure::new(&c.container, &c.account_name, &c.access_key, &c.endpoint)?
+        }
+        StorageConfig::Local(c) => match &c.path {
+            Some(path) => drivers::local::new_with_prefix(path)?,
+            None => drivers::local::new(),
+        },
+        StorageConfig::Null => drivers::null::new(),
+    })
+}
+
 /// Builds the default [`Storage`] from `config.storage`.
 ///
 /// Mirrors [`crate::cache::create_cache_provider`]: the `kind`-tagged config
@@ -74,43 +118,90 @@ pub struct Storage {
 /// Returns an error if the selected driver fails to initialize (e.g. an
 /// invalid `local` path, or a malformed cloud-provider client).
 pub fn create_storage_provider(config: &crate::config::Config) -> StorageResult<Storage> {
-    use crate::config::StorageConfig;
+    Ok(Storage::single(driver_from_config(&config.storage)?))
+}
 
-    let driver = match &config.storage {
-        #[cfg(feature = "storage_aws_s3")]
-        StorageConfig::Aws(c) => match (&c.access_key_id, &c.secret_access_key, &c.endpoint) {
-            (Some(key_id), Some(secret_key), endpoint) => {
-                let credentials = drivers::aws::Credential {
-                    key_id: key_id.clone(),
-                    secret_key: secret_key.clone(),
-                    token: c.session_token.clone(),
-                };
-                match endpoint {
-                    Some(endpoint) => drivers::aws::with_credentials_and_endpoint(
-                        &c.bucket,
-                        &c.region,
-                        endpoint,
-                        credentials,
-                    )?,
-                    None => drivers::aws::with_credentials(&c.bucket, &c.region, credentials)?,
-                }
-            }
-            _ => drivers::aws::new(&c.bucket, &c.region)?,
-        },
-        #[cfg(feature = "storage_gcp")]
-        StorageConfig::Gcp(c) => drivers::gcp::new(&c.bucket, &c.credential_path)?,
-        #[cfg(feature = "storage_azure")]
-        StorageConfig::Azure(c) => {
-            drivers::azure::new(&c.container, &c.account_name, &c.access_key, &c.endpoint)?
+/// Builds one driver per named entry in a multi-store config map.
+///
+/// A lower-level building block than [`create_multi_storage_provider`] — use
+/// that instead unless you need the driver map without a strategy attached.
+///
+/// # Errors
+///
+/// Returns an error if any named store's driver fails to initialize.
+pub fn multi_stores_from_config(
+    configs: &std::collections::HashMap<String, crate::config::StorageConfig>,
+) -> StorageResult<BTreeMap<String, Box<dyn StoreDriver>>> {
+    configs
+        .iter()
+        .map(|(name, cfg)| Ok((name.clone(), driver_from_config(cfg)?)))
+        .collect()
+}
+
+/// Builds a [`strategies::StorageStrategy`] from a
+/// [`crate::config::StorageStrategyConfig`].
+fn strategy_from_config(
+    cfg: &crate::config::StorageStrategyConfig,
+) -> Box<dyn strategies::StorageStrategy> {
+    use crate::config::StorageStrategyConfig;
+
+    match cfg {
+        StorageStrategyConfig::Single { default } => {
+            Box::new(strategies::single::SingleStrategy::new(default))
         }
-        StorageConfig::Local(c) => match &c.path {
-            Some(path) => drivers::local::new_with_prefix(path)?,
-            None => drivers::local::new(),
-        },
-        StorageConfig::Null => drivers::null::new(),
-    };
+        StorageStrategyConfig::Mirror {
+            primary,
+            secondaries,
+            failure_policy,
+        } => Box::new(replicated_strategy(
+            strategies::replicated::ReplicatedStrategy::mirror,
+            primary,
+            secondaries,
+            failure_policy,
+        )),
+        StorageStrategyConfig::Backup {
+            primary,
+            secondaries,
+            failure_policy,
+        } => Box::new(replicated_strategy(
+            strategies::replicated::ReplicatedStrategy::backup,
+            primary,
+            secondaries,
+            failure_policy,
+        )),
+    }
+}
 
-    Ok(Storage::single(driver))
+fn replicated_strategy(
+    ctor: fn(
+        &str,
+        Option<Vec<String>>,
+        strategies::replicated::FailurePolicy,
+    ) -> strategies::replicated::ReplicatedStrategy,
+    primary: &str,
+    secondaries: &[String],
+    failure_policy: &strategies::replicated::FailurePolicy,
+) -> strategies::replicated::ReplicatedStrategy {
+    ctor(primary, Some(secondaries.to_vec()), failure_policy.clone())
+}
+
+/// Builds a multi-store [`Storage`] — several named stores behind one
+/// [`strategies::StorageStrategy`] — from a
+/// [`crate::config::MultiStorageConfig`].
+///
+/// This is what [`crate::initializers::storage::MultiStorageInitializer`]
+/// calls to build the `Extension<std::sync::Arc<Storage>>` it layers onto the
+/// router from `initializers.storage`; call it directly only if you're
+/// wiring the result up some other way.
+///
+/// # Errors
+///
+/// Returns an error if any named store's driver fails to initialize.
+pub fn create_multi_storage_provider(
+    config: &crate::config::MultiStorageConfig,
+) -> StorageResult<Storage> {
+    let stores = multi_stores_from_config(&config.stores)?;
+    Ok(Storage::new(stores, strategy_from_config(&config.strategy)))
 }
 
 impl Storage {
@@ -752,5 +843,136 @@ mod config_provider_tests {
             .await
             .expect("upload into the configured root");
         assert!(tree.root.join("probe.txt").exists());
+    }
+}
+
+#[cfg(test)]
+mod multi_storage_provider_tests {
+    use std::collections::HashMap;
+
+    use crate::config::{
+        LocalStorageConfig, MultiStorageConfig, StorageConfig, StorageStrategyConfig,
+    };
+    use crate::storage::strategies::replicated::FailurePolicy;
+
+    fn local_store(tree: &tree_fs::Tree) -> StorageConfig {
+        StorageConfig::Local(LocalStorageConfig {
+            path: Some(tree.root.display().to_string()),
+        })
+    }
+
+    fn temp_dir() -> tree_fs::Tree {
+        tree_fs::TreeBuilder::default()
+            .drop(true)
+            .create()
+            .expect("temp dir")
+    }
+
+    /// `Single` strategy: unqualified calls hit `default`; the other named
+    /// store is untouched, reachable only by name — the "independent extra
+    /// bucket, no replication" shape.
+    #[tokio::test]
+    async fn single_strategy_routes_unqualified_calls_to_default_only() {
+        let primary_tree = temp_dir();
+        let other_tree = temp_dir();
+
+        let config = MultiStorageConfig {
+            stores: HashMap::from([
+                ("primary".to_string(), local_store(&primary_tree)),
+                ("other".to_string(), local_store(&other_tree)),
+            ]),
+            strategy: StorageStrategyConfig::Single {
+                default: "primary".to_string(),
+            },
+        };
+
+        let storage = super::create_multi_storage_provider(&config).expect("builds");
+        let path = std::path::Path::new("f.txt");
+        storage
+            .upload(path, &bytes::Bytes::from("x"))
+            .await
+            .expect("unqualified upload hits default");
+
+        assert!(primary_tree.root.join("f.txt").exists());
+        assert!(!other_tree.root.join("f.txt").exists());
+
+        // "other" is still directly reachable, just outside the strategy.
+        storage
+            .as_store_err("other")
+            .expect("present")
+            .upload(path, &bytes::Bytes::from("y"))
+            .await
+            .expect("direct upload to a non-default store");
+        assert!(other_tree.root.join("f.txt").exists());
+    }
+
+    /// `Mirror` strategy: an unqualified write fans out to every secondary.
+    #[tokio::test]
+    async fn mirror_strategy_fans_writes_out_to_secondaries() {
+        let primary_tree = temp_dir();
+        let mirror_tree = temp_dir();
+
+        let config = MultiStorageConfig {
+            stores: HashMap::from([
+                ("primary".to_string(), local_store(&primary_tree)),
+                ("mirror".to_string(), local_store(&mirror_tree)),
+            ]),
+            strategy: StorageStrategyConfig::Mirror {
+                primary: "primary".to_string(),
+                secondaries: vec!["mirror".to_string()],
+                failure_policy: FailurePolicy::FailIfAny,
+            },
+        };
+
+        let storage = super::create_multi_storage_provider(&config).expect("builds");
+        let path = std::path::Path::new("f.txt");
+        storage
+            .upload(path, &bytes::Bytes::from("x"))
+            .await
+            .expect("mirrored upload");
+
+        assert!(primary_tree.root.join("f.txt").exists());
+        assert!(mirror_tree.root.join("f.txt").exists());
+    }
+
+    /// `Backup` strategy: writes still fan out, but a download always reads
+    /// from `primary` — even after deleting the file there, the read must
+    /// fail rather than silently falling back to the secondary.
+    #[tokio::test]
+    async fn backup_strategy_never_reads_from_a_secondary() {
+        let primary_tree = temp_dir();
+        let backup_tree = temp_dir();
+
+        let config = MultiStorageConfig {
+            stores: HashMap::from([
+                ("primary".to_string(), local_store(&primary_tree)),
+                ("backup".to_string(), local_store(&backup_tree)),
+            ]),
+            strategy: StorageStrategyConfig::Backup {
+                primary: "primary".to_string(),
+                secondaries: vec!["backup".to_string()],
+                failure_policy: FailurePolicy::AllowAll,
+            },
+        };
+
+        let storage = super::create_multi_storage_provider(&config).expect("builds");
+        let path = std::path::Path::new("f.txt");
+        storage
+            .upload(path, &bytes::Bytes::from("x"))
+            .await
+            .expect("backed-up upload");
+
+        storage
+            .as_store_err("primary")
+            .expect("present")
+            .delete(path)
+            .await
+            .expect("delete from primary directly");
+
+        let result: crate::storage::StorageResult<String> = storage.download(path).await;
+        assert!(
+            result.is_err(),
+            "backup mode must not fall back to the secondary on read"
+        );
     }
 }
