@@ -38,16 +38,18 @@ use crate::storage::{
 
 /// How many secondary-store failures a [`ReplicatedStrategy`] tolerates before
 /// the overall operation is considered failed.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind")]
 pub enum FailurePolicy {
     /// Fail if any secondary store errors.
+    #[default]
     FailIfAny,
     /// Never fail because of secondary-store errors.
     AllowAll,
     /// Tolerate a single secondary failure; fail if more than one errors.
     AllowSingleFailure,
     /// Fail once the number of secondary failures reaches `count`.
-    FailAtFailures(usize),
+    FailAtFailures { count: usize },
 }
 
 impl FailurePolicy {
@@ -57,7 +59,7 @@ impl FailurePolicy {
             Self::FailIfAny => !errors.is_empty(),
             Self::AllowAll => false,
             Self::AllowSingleFailure => errors.len() > 1,
-            Self::FailAtFailures(count) => *count <= errors.len(),
+            Self::FailAtFailures { count } => *count <= errors.len(),
         }
     }
 }
@@ -541,8 +543,8 @@ mod tests {
     #[case::secondary_unwritable_allowed([true, false, true], AllowAll, true, [true, false, true])]
     #[case::one_failure_tolerated([true, false, true], AllowSingleFailure, true, [true, false, true])]
     #[case::two_failures_not_tolerated([true, false, false], AllowSingleFailure, false, [true, false, false])]
-    #[case::below_failure_count([true, false, true], FailAtFailures(2), true, [true, false, true])]
-    #[case::at_failure_count([true, false, false], FailAtFailures(2), false, [true, false, false])]
+    #[case::below_failure_count([true, false, true], FailAtFailures { count: 2 }, true, [true, false, true])]
+    #[case::at_failure_count([true, false, false], FailAtFailures { count: 2 }, false, [true, false, false])]
     #[tokio::test]
     async fn upload(
         #[values(true, false)] mirror: bool,
@@ -578,8 +580,8 @@ mod tests {
     #[case::one_missing_allowed(AllowAll, &["store_2"], true)]
     #[case::one_missing_tolerated(AllowSingleFailure, &["store_2"], true)]
     #[case::two_missing_not_tolerated(AllowSingleFailure, &["store_2", "store_3"], false)]
-    #[case::below_failure_count(FailAtFailures(2), &["store_2"], true)]
-    #[case::at_failure_count(FailAtFailures(2), &["store_2", "store_3"], false)]
+    #[case::below_failure_count(FailAtFailures { count: 2 }, &["store_2"], true)]
+    #[case::at_failure_count(FailAtFailures { count: 2 }, &["store_2", "store_3"], false)]
     #[tokio::test]
     async fn rename(
         #[values(true, false)] mirror: bool,
@@ -620,8 +622,8 @@ mod tests {
     #[case::one_missing_allowed(AllowAll, &["store_2"], true)]
     #[case::one_missing_tolerated(AllowSingleFailure, &["store_2"], true)]
     #[case::two_missing_not_tolerated(AllowSingleFailure, &["store_2", "store_3"], false)]
-    #[case::below_failure_count(FailAtFailures(2), &["store_2"], true)]
-    #[case::at_failure_count(FailAtFailures(2), &["store_2", "store_3"], false)]
+    #[case::below_failure_count(FailAtFailures { count: 2 }, &["store_2"], true)]
+    #[case::at_failure_count(FailAtFailures { count: 2 }, &["store_2", "store_3"], false)]
     #[tokio::test]
     async fn copy(
         #[values(true, false)] mirror: bool,
