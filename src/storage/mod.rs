@@ -69,7 +69,7 @@ pub struct Storage {
 /// Builds a single [`StoreDriver`] from a [`crate::config::StorageConfig`].
 ///
 /// Shared by [`create_storage_provider`] (single default store) and
-/// [`multi_stores_from_config`] (one driver per named store).
+/// [`create_multi_storage_provider`] (one driver per named store).
 fn driver_from_config(cfg: &crate::config::StorageConfig) -> StorageResult<Box<dyn StoreDriver>> {
     use crate::config::StorageConfig;
 
@@ -133,29 +133,13 @@ pub fn create_storage_provider(config: &crate::config::Config) -> StorageResult<
     Ok(Storage::single(driver_from_config(&config.storage)?))
 }
 
-/// Builds one driver per named entry in a multi-store config map.
-///
-/// A lower-level building block than [`create_multi_storage_provider`] — use
-/// that instead unless you need the driver map without a strategy attached.
-///
-/// # Errors
-///
-/// Returns an error if any named store's driver fails to initialize.
-pub fn multi_stores_from_config(
-    configs: &std::collections::HashMap<String, crate::config::StorageConfig>,
-) -> StorageResult<BTreeMap<String, Box<dyn StoreDriver>>> {
-    configs
-        .iter()
-        .map(|(name, cfg)| Ok((name.clone(), driver_from_config(cfg)?)))
-        .collect()
-}
-
 /// Builds a [`strategies::StorageStrategy`] from a
 /// [`crate::config::StorageStrategyConfig`].
 fn strategy_from_config(
     cfg: &crate::config::StorageStrategyConfig,
 ) -> Box<dyn strategies::StorageStrategy> {
     use crate::config::StorageStrategyConfig;
+    use strategies::replicated::ReplicatedStrategy;
 
     match cfg {
         StorageStrategyConfig::Single { default } => {
@@ -165,36 +149,55 @@ fn strategy_from_config(
             primary,
             secondaries,
             failure_policy,
-        } => Box::new(replicated_strategy(
-            strategies::replicated::ReplicatedStrategy::mirror,
+        } => Box::new(ReplicatedStrategy::mirror(
             primary,
-            secondaries,
-            failure_policy,
+            Some(secondaries.clone()),
+            failure_policy.clone(),
         )),
         StorageStrategyConfig::Backup {
             primary,
             secondaries,
             failure_policy,
-        } => Box::new(replicated_strategy(
-            strategies::replicated::ReplicatedStrategy::backup,
+        } => Box::new(ReplicatedStrategy::backup(
             primary,
-            secondaries,
-            failure_policy,
+            Some(secondaries.clone()),
+            failure_policy.clone(),
         )),
     }
 }
 
-fn replicated_strategy(
-    ctor: fn(
-        &str,
-        Option<Vec<String>>,
-        strategies::replicated::FailurePolicy,
-    ) -> strategies::replicated::ReplicatedStrategy,
-    primary: &str,
-    secondaries: &[String],
-    failure_policy: &strategies::replicated::FailurePolicy,
-) -> strategies::replicated::ReplicatedStrategy {
-    ctor(primary, Some(secondaries.to_vec()), failure_policy.clone())
+/// Rejects a strategy that names a store missing from `stores`, or names one
+/// store twice. At runtime a missing secondary only counts as a failure, so
+/// `FailurePolicy::AllowAll` would hide it: writes succeed, nothing replicates.
+fn validate_strategy_stores(config: &crate::config::MultiStorageConfig) -> StorageResult<()> {
+    use crate::config::StorageStrategyConfig;
+
+    let (primary, secondaries) = match &config.strategy {
+        StorageStrategyConfig::Single { default } => (default, [].as_slice()),
+        StorageStrategyConfig::Mirror {
+            primary,
+            secondaries,
+            ..
+        }
+        | StorageStrategyConfig::Backup {
+            primary,
+            secondaries,
+            ..
+        } => (primary, secondaries.as_slice()),
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    for name in std::iter::once(primary).chain(secondaries) {
+        if !config.stores.contains_key(name) {
+            return Err(StorageError::StoreNotFound(name.clone()));
+        }
+        if !seen.insert(name) {
+            return Err(StorageError::Any(
+                format!("store `{name}` is listed more than once in the storage strategy").into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Builds a multi-store [`Storage`] — several named stores behind one
@@ -208,11 +211,17 @@ fn replicated_strategy(
 ///
 /// # Errors
 ///
-/// Returns an error if any named store's driver fails to initialize.
+/// Returns an error if the strategy names a store missing from `stores` or
+/// names one store twice, or if any named store's driver fails to initialize.
 pub fn create_multi_storage_provider(
     config: &crate::config::MultiStorageConfig,
 ) -> StorageResult<Storage> {
-    let stores = multi_stores_from_config(&config.stores)?;
+    validate_strategy_stores(config)?;
+    let stores = config
+        .stores
+        .iter()
+        .map(|(name, cfg)| Ok((name.clone(), driver_from_config(cfg)?)))
+        .collect::<StorageResult<BTreeMap<_, _>>>()?;
     Ok(Storage::new(stores, strategy_from_config(&config.strategy)))
 }
 
@@ -892,7 +901,125 @@ mod multi_storage_provider_tests {
     use crate::config::{
         LocalStorageConfig, MultiStorageConfig, StorageConfig, StorageStrategyConfig,
     };
-    use crate::storage::strategies::replicated::FailurePolicy;
+    use crate::storage::{strategies::replicated::FailurePolicy, StorageError};
+
+    fn null_stores(strategy: StorageStrategyConfig) -> MultiStorageConfig {
+        MultiStorageConfig {
+            stores: HashMap::from([
+                ("primary".to_string(), StorageConfig::Null),
+                ("backup".to_string(), StorageConfig::Null),
+            ]),
+            strategy,
+        }
+    }
+
+    #[test]
+    fn unknown_default_store_is_rejected() {
+        let config = null_stores(StorageStrategyConfig::Single {
+            default: "primry".to_string(),
+        });
+
+        assert!(matches!(
+            super::create_multi_storage_provider(&config),
+            Err(StorageError::StoreNotFound(name)) if name == "primry"
+        ));
+    }
+
+    /// `AllowAll` would otherwise swallow the lookup failure on every write,
+    /// so the app would run with no replication and no error.
+    #[test]
+    fn unknown_secondary_store_is_rejected_even_with_allow_all() {
+        let config = null_stores(StorageStrategyConfig::Backup {
+            primary: "primary".to_string(),
+            secondaries: vec!["bakcup".to_string()],
+            failure_policy: FailurePolicy::AllowAll,
+        });
+
+        assert!(matches!(
+            super::create_multi_storage_provider(&config),
+            Err(StorageError::StoreNotFound(name)) if name == "bakcup"
+        ));
+    }
+
+    /// A store listed twice gets every write twice: the second `rename` finds
+    /// the file already moved and fails the whole operation.
+    #[test]
+    fn store_listed_twice_is_rejected() {
+        let config = null_stores(StorageStrategyConfig::Mirror {
+            primary: "primary".to_string(),
+            secondaries: vec!["primary".to_string()],
+            failure_policy: FailurePolicy::FailIfAny,
+        });
+
+        assert!(matches!(
+            super::create_multi_storage_provider(&config),
+            Err(StorageError::Any(_))
+        ));
+    }
+
+    /// Parses the way `MultiStorageInitializer` does: YAML into a
+    /// `serde_json::Value`, then into the typed config.
+    fn parse(yaml: &str) -> MultiStorageConfig {
+        let raw: serde_json::Value = serde_yaml::from_str(yaml).expect("valid yaml");
+        serde_json::from_value(raw).expect("valid storage config")
+    }
+
+    #[test]
+    fn mirror_config_parses_from_yaml() {
+        let config = parse(
+            r"
+            stores:
+              primary: { kind: Local, path: storage/primary }
+              mirror: { kind: Local }
+            strategy:
+              kind: Mirror
+              primary: primary
+              secondaries: [mirror]
+              failure_policy: { FailAtFailures: 2 }
+            ",
+        );
+
+        assert_eq!(config.stores.len(), 2);
+        assert!(matches!(
+            config.strategy,
+            StorageStrategyConfig::Mirror {
+                ref primary,
+                ref secondaries,
+                failure_policy: FailurePolicy::FailAtFailures(2),
+            } if primary == "primary" && secondaries == &["mirror"]
+        ));
+    }
+
+    #[test]
+    fn backup_config_parses_from_yaml_with_a_unit_policy_or_none() {
+        let with_policy = parse(
+            r"
+            stores: { primary: { kind: Local } }
+            strategy: { kind: Backup, primary: primary, failure_policy: AllowAll }
+            ",
+        );
+        assert!(matches!(
+            with_policy.strategy,
+            StorageStrategyConfig::Backup {
+                failure_policy: FailurePolicy::AllowAll,
+                ..
+            }
+        ));
+
+        let without_policy = parse(
+            r"
+            stores: { primary: { kind: Local } }
+            strategy: { kind: Backup, primary: primary }
+            ",
+        );
+        assert!(matches!(
+            without_policy.strategy,
+            StorageStrategyConfig::Backup {
+                failure_policy: FailurePolicy::FailIfAny,
+                ..
+            }
+        ));
+    }
 
     fn local_store(tree: &tree_fs::Tree) -> StorageConfig {
         StorageConfig::Local(LocalStorageConfig {

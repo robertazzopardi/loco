@@ -124,9 +124,10 @@ pub struct MultiStorageConfig {
 /// map and still reachable via `as_store`, just outside the strategy.
 ///
 /// Two independent mirror/backup groups in a single app need two separate
-/// `Storage` instances (two `MultiStorageConfig` entries under different
-/// initializer keys) — there's no single-`Storage` config shape for that,
-/// because there's no single-`Storage` *code* shape for that either.
+/// `Storage` instances. `MultiStorageInitializer` only reads
+/// `initializers.storage`, so the second one needs your own initializer that
+/// layers it as a newtype: a second `Extension<Arc<Storage>>` would replace
+/// the first.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind")]
 pub enum StorageStrategyConfig {

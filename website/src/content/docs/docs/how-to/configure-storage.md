@@ -118,7 +118,7 @@ initializers:
       kind: Mirror              # or Backup, or Single
       primary: primary
       secondaries: [mirror]
-      failure_policy: { kind: FailIfAny }   # or AllowAll, AllowSingleFailure, or { kind: FailAtFailures, count: 2 }
+      failure_policy: FailIfAny   # or AllowAll, AllowSingleFailure, or { FailAtFailures: 2 }
 ```
 
 ```rust
@@ -155,7 +155,11 @@ initializers:
 storage.as_store_err("public")?.download(path).await?;  // never touched by unqualified storage.download()
 ```
 
-A `Storage`'s `strategy` field is a single value — it governs at most one primary/secondaries fan-out group per `MultiStorageConfig`. A store not named in `primary`/`secondaries`/`default` just sits in `stores`, reachable only via `as_store`. Two independent mirror groups in one app need two separate `initializers.storage`-shaped configs under different keys, each with its own `MultiStorageInitializer`-equivalent registration — there's no single-`Storage` shape for that, because there's no single-`Storage` *code* shape for that either.
+A `Storage`'s `strategy` field is a single value — it governs at most one primary/secondaries fan-out group per `MultiStorageConfig`. A store not named in `primary`/`secondaries`/`default` just sits in `stores`, reachable only via `as_store`. A strategy that names a store missing from `stores`, or names one store twice, fails at startup.
+
+Two independent mirror groups in one app need two `Storage` instances. `MultiStorageInitializer` only reads `initializers.storage`, so the second group needs your own initializer that reads another key and layers its `Storage` in a newtype (for example `Extension<Arc<ArchiveStorage>>`). A second plain `Extension<Arc<Storage>>` would replace the first.
+
+The `Extension` exists only on the HTTP router, so background workers and tasks cannot extract it. If a worker needs these stores, build the `Storage` in code as shown below and put it in `ctx.shared_store` from `after_context`.
 
 ### Or build it in code (still supported)
 
@@ -186,7 +190,7 @@ let storage = Storage::new(
 );
 ```
 
-`FailurePolicy::FailIfAny` requires every secondary to succeed (errors bubble up as `StorageError::Multi`); `AllowAll` swallows secondary failures; `AllowSingleFailure`/`FailAtFailures { count: n }` sit between the two. `ReplicatedStrategy::backup(..)` builds the non-mirroring variant — writes still fan out, but reads always come from the primary only. It exposes a `_with_policy`/`_with_strategy` variant on every `Storage` method (`upload_with_strategy`, `download_with_policy`, ...) if you need to override the strategy for a single call.
+`FailurePolicy::FailIfAny` requires every secondary to succeed (errors bubble up as `StorageError::Multi`); `AllowAll` swallows secondary failures; `AllowSingleFailure`/`FailAtFailures(n)` sit between the two. `ReplicatedStrategy::backup(..)` builds the non-mirroring variant — writes still fan out, but reads always come from the primary only. It exposes a `_with_policy`/`_with_strategy` variant on every `Storage` method (`upload_with_strategy`, `download_with_policy`, ...) if you need to override the strategy for a single call.
 
 ## 5. Upload and download in a controller
 
