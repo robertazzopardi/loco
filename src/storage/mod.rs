@@ -967,16 +967,16 @@ mod multi_storage_provider_tests {
     #[test]
     fn mirror_config_parses_from_yaml() {
         let config = parse(
-            r"
+            r#"
             stores:
               primary: { kind: Local, path: storage/primary }
-              mirror: { kind: Local }
+              mirror: { kind: "Null" }
             strategy:
               kind: Mirror
               primary: primary
               secondaries: [mirror]
               failure_policy: { FailAtFailures: 2 }
-            ",
+            "#,
         );
 
         assert_eq!(config.stores.len(), 2);
@@ -995,7 +995,7 @@ mod multi_storage_provider_tests {
         let with_policy = parse(
             r"
             stores: { primary: { kind: Local } }
-            strategy: { kind: Backup, primary: primary, failure_policy: AllowAll }
+            strategy: { kind: Backup, primary: primary, secondaries: [], failure_policy: AllowAll }
             ",
         );
         assert!(matches!(
@@ -1009,7 +1009,7 @@ mod multi_storage_provider_tests {
         let without_policy = parse(
             r"
             stores: { primary: { kind: Local } }
-            strategy: { kind: Backup, primary: primary }
+            strategy: { kind: Backup, primary: primary, secondaries: [] }
             ",
         );
         assert!(matches!(
@@ -1019,6 +1019,17 @@ mod multi_storage_provider_tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn misspelled_secondaries_key_is_a_config_error() {
+        let raw = serde_json::json!({
+            "stores": { "primary": { "kind": "Local" } },
+            "strategy": { "kind": "Mirror", "primary": "primary", "secondries": ["primary"] },
+        });
+
+        let err = serde_json::from_value::<MultiStorageConfig>(raw).expect_err("key is misspelled");
+        assert!(err.to_string().contains("secondaries"));
     }
 
     fn local_store(tree: &tree_fs::Tree) -> StorageConfig {
